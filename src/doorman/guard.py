@@ -18,10 +18,11 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from doorman.canary import CanaryRegistry
-from doorman.errors import ActionBlocked, ConfirmationRequired, ContentQuarantined
+from doorman.errors import ActionBlocked, ConfirmationRequired, ContentQuarantined, DoormanError
 from doorman.events import EventLog
 from doorman.layers.classifier import Classifier
 from doorman.layers.confirmation_gate import ConfirmationGate
+from doorman.layers.intent_aligner import AlignmentResult, IntentAligner
 from doorman.layers.isolator import IsolatedBlock, Isolator
 from doorman.layers.output_scanner import OutputScanner
 from doorman.layers.tool_policy import ToolPolicy
@@ -91,7 +92,8 @@ class Guard:
     """
     Parameters
     ----------
-    classifier, isolator, tool_policy, output_scanner, confirmation_gate, risk_tracker:
+    classifier, isolator, intent_aligner, tool_policy, output_scanner,
+    confirmation_gate, risk_tracker:
         Layers to compose. All optional.
     event_log:
         Where verdicts are recorded. A fresh ``EventLog`` if not given.
@@ -110,6 +112,7 @@ class Guard:
         *,
         classifier: Classifier | None = None,
         isolator: Isolator | None = None,
+        intent_aligner: IntentAligner | None = None,
         tool_policy: ToolPolicy | None = None,
         output_scanner: OutputScanner | None = None,
         confirmation_gate: ConfirmationGate | None = None,
@@ -120,6 +123,7 @@ class Guard:
     ) -> None:
         self.classifier = classifier
         self.isolator = isolator
+        self.intent_aligner = intent_aligner
         self.tool_policy = tool_policy
         self.output_scanner = output_scanner
         self.confirmation_gate = confirmation_gate
@@ -139,6 +143,24 @@ class Guard:
         )
         if output_scanner is not None:
             output_scanner.registry = self.canaries
+
+        # The operator's task per session, consulted by the IntentAligner.
+        self._tasks: dict[str, str] = {}
+
+    # -- session ------------------------------------------------------------
+
+    def begin_session(self, session_id: str, *, task: str | None = None) -> None:
+        """Register the operator's original task for a session.
+
+        The task is the *trusted* statement of what the agent should do. Give
+        it exactly as the operator phrased it — never a rendered prompt that
+        already includes untrusted documents (the aligner rejects those).
+        """
+        if task is not None:
+            self._tasks[session_id] = task
+
+    def task_for(self, session_id: str) -> str | None:
+        return self._tasks.get(session_id)
 
     # -- ingestion ----------------------------------------------------------
 
@@ -195,9 +217,31 @@ class Guard:
 
     # -- tool calls ---------------------------------------------------------
 
+    def check_intent(
+        self, original_task: str, proposed_action: ToolCall, *, session_id: str | None = None
+    ) -> AlignmentResult:
+        """Run only the IntentAligner. Raises if none is configured."""
+        if self.intent_aligner is None:
+            raise DoormanError("Guard has no intent_aligner configured")
+        result = self.intent_aligner.check(original_task, proposed_action)
+        self._emit(result.verdict, session_id, tool=proposed_action.tool)
+        return result
+
     def check_tool_call(
-        self, call: ToolCall, session_id: str, *, context: str | None = None
+        self,
+        call: ToolCall,
+        session_id: str,
+        *,
+        context: str | None = None,
+        task: str | None = None,
     ) -> GuardDecision:
+        """Run every configured layer over a proposed tool call.
+
+        ``task`` overrides the task registered with ``begin_session``. If the
+        aligner is configured but no task is known, the aligner is skipped and
+        a ``WARN`` verdict says so — silently skipping a control is worse than
+        a noisy log line.
+        """
         risk = self.risk_tracker.risk(session_id) if self.risk_tracker is not None else 0.0
         verdicts: list[Verdict] = []
 
@@ -213,6 +257,9 @@ class Guard:
         if self.output_scanner is not None:
             for v in self.output_scanner.scan_all(call, session_id=session_id):
                 verdicts.append(self._emit(v, session_id, tool=call.tool))
+
+        if self.intent_aligner is not None:
+            verdicts.append(self._align(call, session_id, task))
 
         blocked = any(v.blocked for v in verdicts)
 
@@ -272,10 +319,32 @@ class Guard:
         if self.risk_tracker is not None:
             self.risk_tracker.reset(session_id)
         self.canaries.forget(session_id)
+        self._tasks.pop(session_id, None)
 
     # -- internals ----------------------------------------------------------
 
-    def _emit(self, verdict: Verdict, session_id: str, **context: Any) -> Verdict:
+    def _align(self, call: ToolCall, session_id: str, task: str | None) -> Verdict:
+        assert self.intent_aligner is not None
+        task = task if task is not None else self._tasks.get(session_id)
+        if task is None:
+            return self._emit(
+                Verdict(
+                    decision=Decision.WARN,
+                    layer="intent_aligner",
+                    rule_id="INT-004",
+                    rationale=(
+                        f"Intent check skipped for '{call.tool}': no task registered for "
+                        f"session {session_id!r}. Call guard.begin_session(id, task=...) "
+                        "or pass task= to check_tool_call."
+                    ),
+                    metadata={"tool": call.tool},
+                ),
+                session_id,
+                tool=call.tool,
+            )
+        return self._emit(self.intent_aligner.check(task, call).verdict, session_id, tool=call.tool)
+
+    def _emit(self, verdict: Verdict, session_id: str | None, **context: Any) -> Verdict:
         self.events.emit(verdict, session_id, **context)
         return verdict
 

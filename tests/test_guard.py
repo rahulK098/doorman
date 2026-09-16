@@ -7,8 +7,10 @@ from doorman import (
     ConfirmationRequired,
     ContentQuarantined,
     Decision,
+    DoormanError,
     EventLog,
     Guard,
+    IntentAligner,
     Isolator,
     OutputScanner,
     SessionRiskTracker,
@@ -200,6 +202,55 @@ def test_untrusted_tagged_argument_gets_stricter_scrutiny():
     from_operator = ToolCall("send_email", {"body": Tagged(borderline, Source.TRUSTED, "operator")})
     assert g.check_tool_call(from_doc, "s1").decision is Decision.BLOCK
     assert g.check_tool_call(from_operator, "s1").permits
+
+
+# -- intent alignment ------------------------------------------------------
+
+
+def test_aligner_skipped_with_warning_when_no_task():
+    g = make_guard(intent_aligner=IntentAligner(), confirmation_gate=None)
+    d = g.check_tool_call(ToolCall("write_ats_score"), "s1", context="scoring")
+    warn = next(v for v in d.verdicts if v.layer == "intent_aligner")
+    assert warn.decision is Decision.WARN and warn.rule_id == "INT-004"
+    assert d.permits
+
+
+def test_aligner_uses_registered_task():
+    g = make_guard(intent_aligner=IntentAligner(), confirmation_gate=None)
+    g.begin_session("s1", task="Score the candidate and write the ATS score.")
+    ok = g.check_tool_call(ToolCall("write_ats_score"), "s1", context="scoring")
+    assert ok.permits
+    bad = g.check_tool_call(ToolCall("send_email"), "s1", context="outreach")
+    assert bad.decision is Decision.BLOCK and bad.governing.layer == "intent_aligner"
+    assert bad.governing.rule_id == "INT-001"
+
+
+def test_task_kwarg_overrides_registered_task():
+    g = make_guard(intent_aligner=IntentAligner(), confirmation_gate=None)
+    g.begin_session("s1", task="Score the candidate.")
+    d = g.check_tool_call(
+        ToolCall("send_email"), "s1", context="outreach", task="Email the candidate a rejection."
+    )
+    assert d.permits
+
+
+def test_check_intent_direct():
+    g = make_guard(intent_aligner=IntentAligner())
+    r = g.check_intent("Score the candidate.", ToolCall("send_email"), session_id="s1")
+    assert not r.aligned
+    assert g.events.for_session("s1")[-1].verdict.layer == "intent_aligner"
+
+
+def test_check_intent_without_aligner_raises():
+    with pytest.raises(DoormanError):
+        make_guard().check_intent("t", ToolCall("x"))
+
+
+def test_end_session_forgets_task():
+    g = make_guard(intent_aligner=IntentAligner())
+    g.begin_session("s1", task="x")
+    g.end_session("s1")
+    assert g.task_for("s1") is None
 
 
 # -- lifecycle -------------------------------------------------------------

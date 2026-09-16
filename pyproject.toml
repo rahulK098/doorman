@@ -51,6 +51,7 @@ packages = ["src/doorman"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # so tests can import the examples/ package
 addopts = "-q"
 
 [tool.ruff]

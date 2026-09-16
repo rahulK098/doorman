@@ -31,12 +31,17 @@ from doorman.errors import (
 from doorman.events import Event, EventLog
 from doorman.guard import Guard, GuardDecision, Ingested
 from doorman.layers import (
+    AlignmentBackend,
+    AlignmentJudgement,
+    AlignmentResult,
     Classifier,
     ClassifierBackend,
     ConfirmationGate,
     HeuristicBackend,
+    IntentAligner,
     IsolatedBlock,
     Isolator,
+    KeywordAlignmentBackend,
     OutputScanner,
     ToolPolicy,
 )
@@ -47,6 +52,9 @@ __version__ = "0.1.0.dev0"
 
 __all__ = [
     "ActionBlocked",
+    "AlignmentBackend",
+    "AlignmentJudgement",
+    "AlignmentResult",
     "CanaryRegistry",
     "Classifier",
     "ClassifierBackend",
@@ -61,8 +69,10 @@ __all__ = [
     "GuardDecision",
     "HeuristicBackend",
     "Ingested",
+    "IntentAligner",
     "IsolatedBlock",
     "Isolator",
+    "KeywordAlignmentBackend",
     "MissingExtra",
     "OutputScanner",
     "PrivilegeViolation",
