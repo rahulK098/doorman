@@ -190,6 +190,12 @@ def main(argv: list[str] | None = None) -> int:
     except MissingExtra as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    except ValueError as e:
+        # A malformed or unsafe fixture file, or a bad --target. Fixture corpora
+        # are shared between people, so a bad one should report cleanly rather
+        # than print a traceback.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":  # pragma: no cover

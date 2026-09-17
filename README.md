@@ -216,7 +216,7 @@ No defense that relies on the model's cooperation counts as a control. The syste
 
 ```bash
 uv sync --group dev
-uv run pytest                  # 393 tests
+uv run pytest                  # 416 tests
 uv run ruff check . && uv run mypy
 
 # Regenerate the base fixture set (committed; deterministic)

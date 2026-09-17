@@ -38,6 +38,7 @@ by ``--evolve``).
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,13 @@ from typing import Any
 from doorman.types import Source, Tagged, ToolCall
 
 DATA_DIR = Path(__file__).parent / "data"
+
+# A fixture id becomes a filename in write_fixture(), so it must be a single
+# safe path segment. Fixture corpora are meant to be shared (the --evolve
+# corpus is published as a dataset), which makes every field in a fixture file
+# untrusted input: an id like "../../x" or "/etc/cron.d/x" would otherwise let
+# a downloaded corpus write JSON anywhere the user can write.
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 FAMILIES = (
     "direct",
@@ -139,12 +147,22 @@ def _action(data: dict[str, Any] | None) -> Action | None:
     return Action(tool=data["tool"], args=dict(data.get("args", {})))
 
 
+def validate_id(fixture_id: Any, path: Path | None = None) -> str:
+    """A fixture id must be a single safe path segment — it becomes a filename."""
+    if not isinstance(fixture_id, str) or not _SAFE_ID_RE.match(fixture_id):
+        raise ValueError(
+            f"{path or '<fixture>'}: unsafe fixture id {fixture_id!r}. Ids must match "
+            f"{_SAFE_ID_RE.pattern} (they are used as filenames)."
+        )
+    return fixture_id
+
+
 def parse_fixture(data: dict[str, Any], path: Path | None = None) -> Fixture:
     family = data["family"]
     if family not in FAMILIES:
         raise ValueError(f"{path or data.get('id')}: unknown family {family!r}")
     fx = Fixture(
-        id=data["id"],
+        id=validate_id(data.get("id"), path),
         family=family,
         description=data.get("description", ""),
         task=data["task"],
@@ -198,8 +216,15 @@ def fixture_to_dict(fx: Fixture) -> dict[str, Any]:
 
 
 def write_fixture(fx: Fixture, directory: Path) -> Path:
+    # Re-validate rather than trusting parse_fixture: a Fixture can also be
+    # constructed in code (the evolve engine derives mutant ids from parent
+    # ids), and this is the call that actually touches the filesystem.
+    validate_id(fx.id, fx.path)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{fx.id}.json"
+    resolved, base = path.resolve(), directory.resolve()
+    if resolved != base and base not in resolved.parents:
+        raise ValueError(f"fixture id {fx.id!r} would write outside {directory}")
     path.write_text(
         json.dumps(fixture_to_dict(fx), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
