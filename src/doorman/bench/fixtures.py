@@ -85,6 +85,16 @@ class Fixture:
     success_condition: str = "action_executed"
     expected_verdict: str = "block"
     path: Path | None = None
+    meta: dict[str, Any] = field(default_factory=dict)  # lineage for discovered fixtures etc.
+    # Indices of the documents that carry the attack. If every one of them is
+    # quarantined, the model never saw the attack. Defaults to all documents.
+    payload_documents: tuple[int, ...] | None = None
+
+    @property
+    def payload_indices(self) -> tuple[int, ...]:
+        if self.payload_documents is not None:
+            return self.payload_documents
+        return tuple(range(len(self.documents)))
 
     @property
     def action(self) -> Action:
@@ -146,9 +156,54 @@ def parse_fixture(data: dict[str, Any], path: Path | None = None) -> Fixture:
         success_condition=data.get("success_condition", "action_executed"),
         expected_verdict=data.get("expected_verdict", "block" if data["attack"] else "allow"),
         path=path,
+        meta=dict(data.get("meta", {})),
+        payload_documents=(
+            tuple(int(i) for i in data["payload_documents"])
+            if "payload_documents" in data
+            else None
+        ),
     )
     _ = fx.action  # raises if the required action is missing
+    for i in fx.payload_indices:
+        if not 0 <= i < len(fx.documents):
+            raise ValueError(f"{fx.id}: payload_documents index {i} out of range")
     return fx
+
+
+def fixture_to_dict(fx: Fixture) -> dict[str, Any]:
+    """Inverse of ``parse_fixture`` (minus ``path``), for writing discovered fixtures."""
+    data: dict[str, Any] = {
+        "id": fx.id,
+        "family": fx.family,
+        "description": fx.description,
+        "task": fx.task,
+        "context": fx.context,
+        "documents": [{"origin": d.origin, "content": d.content} for d in fx.documents],
+        "attack": fx.attack,
+    }
+    if fx.malicious_action is not None:
+        data["malicious_action"] = {
+            "tool": fx.malicious_action.tool,
+            "args": fx.malicious_action.args,
+        }
+    if fx.benign_action is not None:
+        data["benign_action"] = {"tool": fx.benign_action.tool, "args": fx.benign_action.args}
+    data["success_condition"] = fx.success_condition
+    data["expected_verdict"] = fx.expected_verdict
+    if fx.payload_documents is not None:
+        data["payload_documents"] = list(fx.payload_documents)
+    if fx.meta:
+        data["meta"] = fx.meta
+    return data
+
+
+def write_fixture(fx: Fixture, directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{fx.id}.json"
+    path.write_text(
+        json.dumps(fixture_to_dict(fx), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
 
 
 def iter_fixtures(root: Path = DATA_DIR, family: str | None = None) -> Iterator[Fixture]:

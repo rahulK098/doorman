@@ -131,11 +131,15 @@ def test_provenance_flips_scanner_verdict_for_identical_text():
 
 
 @pytest.mark.parametrize("fx", load_fixtures("benign"), ids=lambda f: f.id)
-def test_benign_fixtures_are_allowed(fx: Fixture):
+def test_benign_fixtures_are_never_blocked(fx: Fixture):
+    """Benign actions may be *held* for a human (irreversible tools) but never blocked."""
     g = reference_guard()
     ingest, decision = run_fixture(g, fx)
     assert all(d is Decision.ALLOW for d in ingest), ingest
-    assert decision.decision is Decision.ALLOW, decision.rationale
+    assert decision.decision is not Decision.BLOCK, decision.rationale
+    if decision.decision is Decision.CONFIRM:
+        holders = {v.rule_id for v in decision.verdicts if v.decision is Decision.CONFIRM}
+        assert holders == {"GATE-001"}, holders  # only the irreversible-tool gate, nothing else
 
 
 # -- every block has a rationale ---------------------------------------------

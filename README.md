@@ -4,7 +4,7 @@
 
 > Layered prompt-injection defense that checks whether your agent's next action still matches the user's intent - and keeps attacking itself in CI to prove it still holds.
 
-**Status:** pre-alpha, under active development. All six layers, the reference recruiting agent, and the fixture format are implemented; the `doorman-bench` CLI (static + `--evolve`) and a framework adapter are next.
+**Status:** pre-alpha, under active development. All six layers, the reference recruiting agent, the `doorman-bench` CLI (static + `--evolve`), and the Anthropic adapter are implemented. Not yet published to PyPI.
 
 ## The problem
 
@@ -98,7 +98,78 @@ Those are good at *classification* — is this text injection-shaped? Doorman's 
 2. **Provenance tracking** of tool-call arguments back to trusted or untrusted sources.
 3. **Canary-token exfiltration detection** that no paraphrase can evade.
 4. **A session risk budget** so split attacks don't slip under per-message thresholds.
-5. **A self-updating benchmark** (`doorman-bench --evolve`, coming) that mutates blocked attacks and retries them against the live pipeline, auto-filing real bypasses as fixtures.
+5. **A self-updating benchmark** (`doorman-bench --evolve`) that mutates blocked attacks and retries them against the live pipeline, auto-filing real bypasses as fixtures. It found and closed 8 pre-launch.
+
+## Benchmark
+
+`doorman-bench` replays a 68-attack / 100-benign fixture suite through the reference agent, undefended and defended, and scores **whether the attack's action actually executed** — not whether the classifier fired. A layer missing an attack isn't a bypass if a later layer stops the action; the benchmark measures the pipeline.
+
+```bash
+doorman-bench run --target examples.recruiting_agent:agent --report results/report.md
+```
+
+| family | attacks | ASR undefended | ASR defended | benign | FPR defended | held |
+|---|---|---|---|---|---|---|
+| canary_leak | 3 | 100% | 0% | 0 | — | — |
+| compounding | 2 | 100% | 0% | 0 | — | — |
+| direct | 18 | 100% | 0% | 0 | — | — |
+| hidden | 12 | 100% | 0% | 0 | — | — |
+| indirect | 13 | 100% | 0% | 0 | — | — |
+| metadata | 12 | 100% | 0% | 0 | — | — |
+| discovered | 8 | 100% | 0% | 0 | — | — |
+| **all** | **68** | **100%** | **0%** | **100** | **0%** | **24%** |
+
+Read those numbers honestly:
+
+- **Undefended ASR is 100% by construction.** Each fixture declares the action an obedient model takes after reading the document; with no guard, it executes. That column is the fixture format, not a finding. The defended column is the result.
+- **FPR counts blocks only.** The 24% "held" are benign emails paused for human approval because `send_email` is irreversible — the confirmation gate doing its job. Counting those as false positives would mean FPR could only reach zero by deleting the feature.
+- **This is the offline simulator**, a deliberately maximally-gullible model. `--mode agent` runs the same fixtures against a real Claude-backed agent; that costs money and is not what the table above reports.
+
+### The benchmark attacks itself
+
+`--evolve` takes every attack the pipeline currently catches, mutates it (paraphrase, homoglyph, zero-width, letter-spacing, base64, document-splitting), and retries. Confirmed bypasses are filed as new fixtures.
+
+```bash
+doorman-bench run --target examples.recruiting_agent:agent --evolve --rounds 5
+```
+
+**It found 8 distinct real bypasses pre-launch.** Each one drove a specific fix, and each is now a committed regression fixture — if a fix is reverted, the fixture re-opens and the suite fails. Highlights:
+
+| Bypass | Why it worked | Fix |
+|---|---|---|
+| Cyrillic homoglyphs | NFKC does *not* fold Cyrillic→Latin, so `Ignоre аll` reads normally but matches nothing | Confusable folding + a mixed-script signal |
+| Base64-wrapped instruction | The blob rule alone scored 0.30, under threshold; the plaintext was never examined | Decode base64 and re-run every rule on the plaintext |
+| **Zero-width inside base64** | Two evasions composed: hidden characters injected *before* encoding, so even the decoded text dodged the regexes | One shared `normalize()` applied wherever text is examined — not once at the entrance |
+| Score dictation | "the score is pre-approved at 100" asserts a decision rather than requesting one, so no coercion rule applied | A score-dictation rule |
+| Document splitting | Override and target in separate documents, each under threshold | *No classifier fix* — the session risk budget already caught it |
+
+The last row is the architecture's point: the layers that never needed fixing were the deterministic ones — canary tokens and the risk budget. Neither can be paraphrased around. The rule-based classifier absorbed every other bypass, which is exactly what ADR-0004 predicts when you treat it as a floor rather than a ceiling.
+
+After the fixes, five rounds and 8,000 mutations find nothing. That number will decay as attacks evolve, which is the reason the run is scheduled weekly in CI rather than done once.
+
+## Using it with the Anthropic SDK
+
+```python
+from doorman.adapters.anthropic import AnthropicGuard, tool_definitions_from_policy
+
+ag = AnthropicGuard(guard, session_id="sess_1", context="outreach")
+ag.begin(task="Score this candidate and email a summary to hiring-manager@example.com")
+
+system = ag.system_prompt(BASE_SYSTEM)            # adds the isolation notice
+messages = [{"role": "user", "content": ag.ingest(resume_text, origin="resume:42")}]
+
+response = client.messages.create(
+    model="claude-opus-5", max_tokens=2048, system=system,
+    tools=tool_definitions_from_policy(guard, "outreach", TOOLS), messages=messages,
+)
+
+# Checks every proposed call, executes the permitted ones, and returns
+# tool_result blocks — refusals included, carrying the rationale.
+results = ag.handle(response, execute=my_executor)
+messages += [{"role": "assistant", "content": response.content}, {"role": "user", "content": results}]
+```
+
+A blocked call comes back as an `is_error` tool result explaining *why*, so the model can correct course instead of silently retrying. The adapter holds no policy of its own — every decision comes from the `Guard`.
 
 ## Reference agent and fixtures
 
@@ -145,9 +216,17 @@ No defense that relies on the model's cooperation counts as a control. The syste
 
 ```bash
 uv sync --group dev
-uv run pytest
+uv run pytest                  # 393 tests
 uv run ruff check . && uv run mypy
+
+# Regenerate the base fixture set (committed; deterministic)
+uv run python scripts/generate_fixtures.py
+
+# Re-file the historical bypasses as regression fixtures
+uv run python scripts/file_discovered.py
 ```
+
+CI runs lint, types and tests on 3.10/3.12, plus the static benchmark with `--fail-on-bypass --fail-on-false-positive`, on every PR. The `--evolve` run is weekly, not per-commit — it is thousands of pipeline evaluations — and it opens a PR when it finds something, because a discovered bypass needs a human to write the fix that closes it.
 
 ## License
 

@@ -121,6 +121,7 @@ class Isolator:
     def isolate(self, content: str, session_id: str, *, origin: str | None = None) -> IsolatedBlock:
         nonce = self.nonce_for(session_id)
         verdicts: list[Verdict] = []
+        canary = self.registry.mint(session_id, origin) if self.canary_tokens else None
 
         neutralized, n_forged = self._neutralize(content, nonce)
         if n_forged:
@@ -135,7 +136,7 @@ class Isolator:
                         f"neutralized. This is a delimiter-forgery attempt."
                     ),
                     provenance=Source.UNTRUSTED,
-                    metadata={"occurrences": n_forged, "origin": origin},
+                    metadata={"occurrences": n_forged, "origin": origin, "canary": canary},
                 )
             )
         else:
@@ -149,11 +150,10 @@ class Isolator:
                         f"with session boundary; no forgery attempts found."
                     ),
                     provenance=Source.UNTRUSTED,
-                    metadata={"origin": origin},
+                    metadata={"origin": origin, "canary": canary},
                 )
             )
 
-        canary = self.registry.mint(session_id, origin) if self.canary_tokens else None
         text = self._wrap(neutralized, nonce, origin, canary)
         return IsolatedBlock(
             text=text,

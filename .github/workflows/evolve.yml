@@ -1,0 +1,104 @@
+name: Evolve (red-team)
+
+# The self-updating red-team run. Scheduled rather than per-PR: it is far more
+# expensive than the static benchmark (thousands of pipeline evaluations, and
+# real API calls when --mutator anthropic is used).
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Mutation rounds
+        default: "5"
+      mutator:
+        description: rules (offline, free) or anthropic (LLM, costs money)
+        default: rules
+        type: choice
+        options: [rules, anthropic]
+      max_evaluations:
+        description: Hard cap on pipeline evaluations
+        default: "8000"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: |
+          if [ "${{ inputs.mutator || 'rules' }}" = "anthropic" ]; then
+            uv sync --group dev --extra anthropic
+          else
+            uv sync --group dev
+          fi
+
+      - name: Evolve
+        env:
+          # Only consumed by --mutator anthropic; the default rules mutator is offline.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          uv run doorman-bench -v run \
+            --target examples.recruiting_agent:agent \
+            --evolve \
+            --mutator "${{ inputs.mutator || 'rules' }}" \
+            --rounds "${{ inputs.rounds || '5' }}" \
+            --max-evaluations "${{ inputs.max_evaluations || '8000' }}" \
+            --report results/evolve-report.md \
+            | tee results/evolve.log
+
+      - name: Summary
+        if: always()
+        run: cat results/evolve-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Did we find anything?
+        id: found
+        run: |
+          if git status --porcelain src/doorman/bench/data/discovered | grep -q .; then
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "count=$(git status --porcelain src/doorman/bench/data/discovered | wc -l)" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A discovered bypass opens a PR rather than landing on main: each one
+      # needs a human to write the fix that closes it, and the fixture is the
+      # regression test for that fix.
+      - name: Open a PR with the new fixtures
+        if: steps.found.outputs.new == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: evolve/discovered-${{ github.run_number }}
+          title: "red-team: ${{ steps.found.outputs.count }} new bypass(es) discovered"
+          body: |
+            `doorman-bench --evolve` found attack variants that get past the
+            current pipeline. Each new file under
+            `src/doorman/bench/data/discovered/` is a **confirmed bypass**.
+
+            To close one:
+            1. Read its `description` and `meta.strategy` to see how it evaded.
+            2. Fix the layer that should have caught it.
+            3. Add `meta.closed_by` naming the rule that now catches it.
+            4. `tests/test_bench.py::test_discovered_fixtures_stay_closed` turns
+               green and becomes the permanent regression test for that fix.
+
+            Mutator: `${{ inputs.mutator || 'rules' }}` ·
+            rounds: `${{ inputs.rounds || '5' }}`.
+
+            Full report in the run summary and the `evolve-report` artifact.
+          labels: red-team
+          add-paths: src/doorman/bench/data/discovered
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evolve-report
+          path: results/

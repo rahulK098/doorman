@@ -164,10 +164,18 @@ def test_keyword_backend_uses_synonyms():
     assert r.aligned
 
 
-def test_keyword_backend_partial_match_is_uncertain():
+def test_keyword_backend_allows_partial_match():
+    """A keyword matcher can't tell 'send an email' from 'send a calendar invite',
+    so a partial match is reported as aligned rather than dragging in a human."""
     r = IntentAligner().check("Send the candidate a calendar invite.", ToolCall("send_email"))
-    # "send" matches, "email" does not -> aligned but low confidence -> CONFIRM
-    assert r.verdict.decision is Decision.CONFIRM
+    assert r.aligned and r.verdict.decision is Decision.ALLOW
+    assert "1/2 meaningful parts" in r.rationale
+
+
+def test_keyword_backend_ignores_short_identifier_parts():
+    """'ats' in write_ats_score is a system identifier; a task never says it."""
+    r = IntentAligner().check("Score this candidate.", ToolCall("write_ats_score"))
+    assert r.aligned and r.verdict.decision is Decision.ALLOW
 
 
 def test_keyword_backend_handles_garbage_prompt():

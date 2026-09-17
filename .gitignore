@@ -11,8 +11,11 @@ build/
 .coverage
 htmlcov/
 
-# Bench output (Phase 3) — reports are regenerated; discovered fixtures are committed
-results/report*.md
+# Bench output. results/report.md IS committed — it is the published benchmark
+# evidence. Per-run scratch output is not.
+results/outcomes.jsonl
+results/evolve*.md
+results/evolve.log
 
 # Editors / OS
 .vscode/

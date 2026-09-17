@@ -136,8 +136,16 @@ class KeywordAlignmentBackend:
 
     This is deliberately crude. It exists so the layer works with no API key
     for tests, demos and the static benchmark; it is *not* a substitute for a
-    model-backed judge. Its verdicts carry ``confidence <= 0.6`` so the
-    aligner routes uncertain cases to ``CONFIRM`` rather than ``BLOCK``.
+    model-backed judge. Its verdicts carry ``confidence <= 0.6``, so the
+    aligner never treats it as certain.
+
+    It answers one question well — *does the task mention this action at all?*
+    — and refuses to grade shades in between. A partial match ("send" present,
+    "email" absent) is reported as aligned rather than uncertain: a keyword
+    matcher cannot tell "send an email" from "send a calendar invite", and
+    routing every compound tool name to a human would make the layer so noisy
+    that hosts would switch it off. Blocking is reserved for the case it is
+    actually good at: the task mentions nothing resembling the tool.
     """
 
     name = "keyword"
@@ -162,7 +170,11 @@ class KeywordAlignmentBackend:
         task_m = self._TASK_RE.search(prompt)
         if not tool_m or not task_m:
             return AlignmentJudgement(False, 0.0, "could not parse the alignment prompt")
-        tool_words = [w for w in self._SPLIT_RE.split(tool_m.group(1).lower()) if w]
+        parts = [w for w in self._SPLIT_RE.split(tool_m.group(1).lower()) if w]
+        # Short tokens in a tool name are system identifiers, not intent words
+        # ("ats" in write_ats_score, "db", "api"). A task never mentions them,
+        # so counting them would drag every such tool toward "unaligned".
+        tool_words = [w for w in parts if len(w) > 3] or parts
         task_words = {w for w in self._SPLIT_RE.split(task_m.group(1).lower()) if w}
 
         hits = 0
@@ -174,10 +186,14 @@ class KeywordAlignmentBackend:
             return AlignmentJudgement(False, 0.0, "empty tool name")
         share = hits / len(tool_words)
         if share == 1.0:
-            return AlignmentJudgement(True, 0.6, f"task mentions every part of '{tool_m.group(1)}'")
+            return AlignmentJudgement(
+                True, 0.6, f"task mentions every meaningful part of '{tool_m.group(1)}'"
+            )
         if share > 0:
             return AlignmentJudgement(
-                True, 0.3, f"task mentions {hits}/{len(tool_words)} parts of '{tool_m.group(1)}'"
+                True,
+                0.5,
+                f"task mentions {hits}/{len(tool_words)} meaningful parts of '{tool_m.group(1)}'",
             )
         return AlignmentJudgement(
             False, 0.6, f"task never mentions '{tool_m.group(1)}' or a synonym"
